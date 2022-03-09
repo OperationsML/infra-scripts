@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 3rd party git integration with CodePipeline
+Metadata:
+  LICENSE: >-
+    Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this
+    software and associated documentation files (the "Software"), to deal in the Software
+    without restriction, including without limitation the rights to use, copy, modify,
+    merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+    INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+    PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+    HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+    OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Parameters:
+  Vpc:
+    Description: The VPC you want to deploy the Git Pull lambda function and CodeBuild into.
+    Type: 'AWS::EC2::VPC::Id'
+
+  Subnets:
+    Description: The subnet that the git pull Lambda function  and CodeBuild will be deployed in. This should be a private subnet with a NAT gateway and your source control should be accessible from this subnet.
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+  SecurityGroup:
+    Description: The security group to attach to the CodeBuild instance
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+
+  Branch:
+    Description: 'Git branch to pull.'
+    Type: String
+    Default: 'main'
+
+  AccountPrivateToken:
+    Description: 'Private access token for your gitlab acccount'
+    Type: String
+
+
+  GitUrl:
+    Description: URL for git pull
+    Type: String
+
+  ContextPath:
+    Description: If the project is in a sub directory, provide the context path
+    Type: String
+    Default: '.'
+
+  SourceActionVersion:
+    Description: The version of the custom source action to use.
+    Type: String
+    Default: '1'
+
+  SourceActionProvider:
+    Description: The provider name of the custom source action.
+    Type: String
+    Default: 'Delta-ODS-GitLab'
+
+  ProjectName:
+    Description: Name for CodePipeline. A good pattern is GitLab Group followed by Git repo name. ex=ccoe.my-project-name
+    Type: String
+    Default: 'fmops-template'
+
+  GitLabAccessTokenUserName:
+    Description: The deploy token for the GitLab repo.
+    Type: String
+    NoEcho: 'true'
+
+  GitLabAccessTokenPassword:
+    Description: The deploy token for the GitLab repo.
+    Type: String
+    NoEcho: 'true'
+
+  GitWebHookIpAddress:
+    Description: Git WebHook source IP address.
+    Type: String
+
+  TopLevelDirectory:
+    Description: Name for CodePipeline. A good pattern is GitLab Group followed by Git repo name. ex=ccoe.my-project-name
+    Type: String
+    Default: 'fmops-template'
+
+  S3Bucket:
+    Description: S3 Bucket for artifacts
+    Type: String
+
+  S3BucketArn:
+    Type: String
+
+  Email:
+    Description: Email to notify user.
+    Type: String
+
+
+Resources:
+
+  AccessTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: The user and access token for the GitLab project
+      SecretString: !Sub "${GitLabAccessTokenUserName}:${GitLabAccessTokenPassword}"
+  
+  ############################################# CodeBuild Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub delegate-admin-codebuild-train-${ProjectName}-role
+      MaxSessionDuration: 3600
+      Description: "Allows CodeBuild to call AWS services"
+      AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Principal:
+                Service: "codebuild.amazonaws.com"
+            Action:
+                - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+          - !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-iam-access-policy
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-boundary-policy
+      Policies:
+        - PolicyName: AWS-CodeBuild-Train-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:PutLogEvents"
+                  - "logs:CreateLogStream"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - 
+                Effect: Allow
+                Action:
+                  - 'sagemaker:CreatePipeline'
+                  - 'sagemaker:UpdatePipeline*'
+                  - 'sagemaker:DeletePipeline'
+                  - 'sagemaker:DescribePipeline'
+                  - 'sagemaker:DescribePipelineExecution'
+                  - 'sagemaker:DescribePipelineDefinitionForExecution'
+                  - 'sagemaker:ListPipeline*'
+                  - 'sagemaker:StartPipelineExecution'
+                  - 'sagemaker:RetryPipelineExecution'
+                  - 'sagemaker:StopPipelineExecution'
+                  - 'sagemaker:SendPipelineExecutionStepFailure'
+                  - 'sagemaker:SendPipelineExecutionStepSuccess'
+                  - 'sagemaker:ListTags'
+                  - 'sagemaker:AddTags'
+                Resource : '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - "s3:GetBucketAcl"
+                  - "s3:GetBucketLocation"
+                  - "s3:ListObjects"
+                  - "s3:ListBuckets"
+                  - "s3:CreateBucket"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                Resource:
+                  - Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*
+              - 
+                Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+              - 
+                Effect: Allow
+                Action:
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParameter'
+                Resource : '*'
+              - 
+                Effect: Allow
+                Action:
+                  - "cloudformation:*"
+                Resource : '*'
+              - 
+                Effect: Allow
+                Action: 
+                  - "apigateway:PUT"
+                  - "apigateway:GET"
+                Resource: "*"
+              - 
+                Effect: Allow
+                Action:
+                  - 'codebuild:*'
+                Resource: '*'
+              - 
+                Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeDhcpOptions"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeVpcs"
+                Resource: '*'
+              - 
+                Effect: Allow
+                Action:
+                    - 'ec2:CreateNetworkInterfacePermission'
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                Condition:
+                  StringEquals: {"ec2:Subnet": [{
+                      "Fn::Join": ["", ["arn:aws:ec2:", {"Ref" : "AWS::Region" },":", {"Ref" : "AWS::AccountId"}, ":subnet/", { "Fn::Select" : [ "0", {"Ref": "Subnets"} ] }
+                        ]
+                      ]
+                    },
+                    {
+                      "Fn::Join": ["", ["arn:aws:ec2:", {"Ref" : "AWS::Region" },":", {"Ref" : "AWS::AccountId"}, ":subnet/", { "Fn::Select" : [ "1", {"Ref": "Subnets"} ] }
+                        ]
+                      ]
+                    }],
+                  "ec2:AuthorizedService": "codebuild.amazonaws.com"}
+
+  # Create codepipeline role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub delegate-admin-codepipeline-train-${ProjectName}-role
+      MaxSessionDuration: 3600
+      Description: "Allows CodeBuild to call AWS services"
+      AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+          - !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-iam-access-policy
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-boundary-policy
+      Policies:
+        - PolicyName: AWS-Codepipeline-Train-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - "s3:GetBucketAcl"
+                  - "s3:GetBucketLocation"
+                  - "s3:ListObjects"
+                  - "s3:ListBuckets"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                - 'secretsmanager:GetSecretValue'
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+              - Effect: Allow
+                Action: 
+                - 'cloudformation:*'
+                Resource: '*'
+
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      VpcConfig:
+        VpcId: !Ref Vpc
+        SecurityGroupIds: !Ref SecurityGroup
+        Subnets: !Ref Subnets
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:3.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: TopLevelDirectory
+            Value: !Ref TopLevelDirectory
+            Type: PLAINTEXT
+
+      ServiceRole: !GetAtt "CodeBuildServiceRole.Arn" 
+      Source:
+        BuildSpec: !Sub |
+            version: 0.2
+            env:
+              parameter-store:
+                SAGEMAKER_EXEC_ROLE: /ods/ml/OpsDataLakeSageMakerExecutionRole
+              exported-variables:
+                PROJECT_NAME
+
+            phases:
+              install:
+                runtime-versions:
+                  python: 3.8
+                commands:
+                  - pip install shyaml
+                  - pip install --upgrade --force-reinstall awscli
+                  - pip --default-timeout=1000 install -r ${TopLevelDirectory}/pipeline/requirements.txt
+              build:
+                commands:
+                  - cron=$(cat ${TopLevelDirectory}/pipeline/flight-config.yaml | shyaml get-value schedule)
+                  - CRON_SCHED=$(echo "$cron")
+                  - echo "$CRON_SCHED" > "${TopLevelDirectory}/pipeline/cron.txt"
+                  - python ${TopLevelDirectory}/flight_runner.py --sm_role $SAGEMAKER_EXEC_ROLE --run_flight True
+                  - export PROJECT_NAME=${ProjectName}
+            artifacts:
+              files:
+                - 'cron.txt'
+              base-directory: '${TopLevelDirectory}/pipeline'
+
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 14
+
+  Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Ref S3Bucket
+      Name: !Ref ProjectName
+      RoleArn: !GetAtt "CodePipelineServiceRole.Arn"
+      Stages:
+        - Name: 'Source'
+          Actions:
+            - Name: 'Source'
+              ActionTypeId:
+                Category: 'Source'
+                Owner: 'Custom'
+                Version: !Ref SourceActionVersion
+                Provider: !Ref SourceActionProvider
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Branch: !Ref Branch
+                GitUrl: !Ref GitUrl
+                ContextPath: !Ref ContextPath
+                PipelineName: !Ref ProjectName
+                AccessTokenSecretKeyName: !Ref AccessTokenSecret
+              RunOrder: 1
+              
+        - Name: 'Build'
+          Actions:
+            - Name: 'CodeBuild'
+              Namespace: 'Buildvars'
+              ActionTypeId:
+                Category: 'Build'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeBuild'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              RunOrder: 1
+
+        - Name: 'ScheduleLambda'
+          Actions:
+            - Name: 'SchedLambda'
+              Namespace: 'SchedLam'
+              ActionTypeId:
+                Category: 'Invoke'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'Lambda'
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: LambdaOutput
+              Configuration:
+                FunctionName: schedule-codepipeline-lambda
+                UserParameters: !Sub "#{Buildvars.PROJECT_NAME}"
+
+  # Need this for schedule lambda
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub delegate-admin-cloudwatch-${ProjectName}-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+          - !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-iam-access-policy
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-boundary-policy
+      Policies:
+        -
+          PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref Pipeline ] ]
+
+  PipelineWebhook:
+    Type: "AWS::CodePipeline::Webhook"
+    Properties:
+      TargetPipeline: !Ref Pipeline
+      TargetPipelineVersion: 1
+      TargetAction: Source
+      Filters:
+        - JsonPath: '$.ref'
+          MatchEquals: 'refs/heads/{Branch}'
+      Authentication: IP
+      AuthenticationConfiguration:
+        AllowedIPRange: !Ref GitWebHookIpAddress
+      RegisterWithThirdParty: false
+
+Outputs:
+  CodePipelineWebHookUrl:
+    Value: !GetAtt PipelineWebhook.Url
+

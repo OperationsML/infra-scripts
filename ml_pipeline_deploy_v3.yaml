@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy template for sagemaker pipelines
+
+Parameters:
+  Email:
+    Description: "Email of user"
+    Type: String
+
+  S3Bucket:
+    Description: 'MLOps S3 bucket'
+    Type: String
+
+  MLFlowLambdaKey:
+    Description: 'MLOps S3 bucket'
+    Type: String
+
+  ModelArtifactKey:
+    Description: "Generic key for a model artifact zip file. This will be used by codepipeline to detect changes."
+    Type: String
+
+  ProjectName:
+    Description: 'Name of ML project'
+    Type: String
+    Default: 'fmops-template'
+
+  CodePipelineName:
+    Description: Name for CodePipeline.
+    Type: String
+    Default: 'fmops-template-deploy'
+
+  GitLabAccessTokenUserName:
+    Description: The deploy token for the GitLab repo.
+    Type: String
+    NoEcho: 'true'
+
+
+  GitLabAccessTokenPassword:
+    Description: The deploy token for the GitLab repo.
+    Type: String
+    NoEcho: 'true'
+
+  GitUrl:
+    Description: URL for git pull of SAM app
+    Type: String
+
+  Branch:
+    Description: 'Git branch to pull.'
+    Type: String
+    Default: 'main'
+
+  ContextPath:
+    Description: If the project is in a sub directory, provide the context path
+    Type: String
+    Default: '.'
+
+  Subnets:
+    Description: The subnets that will be used for efs and lambda.
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+  VpcId:
+    Description: The VPC you want to deploy the lambda functions and efs system to.
+    Type: 'AWS::EC2::VPC::Id'
+
+  SecurityGroup:
+    Description: The security group to attach to the CodeBuild instance
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+
+  EfsId:
+    Description: Arn for the EFS access point that contains python packages needed to run the monitoring lambda code.
+    Type: String
+
+
+
+Resources:
+
+  GitLabTokenUserName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/GitLabTokenUserName"
+      Type: String
+      Value: !Ref GitLabAccessTokenUserName
+
+  GitLabTokenUserPassword:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/GitLabTokenPassword"
+      Type: String
+      Value: !Ref GitLabAccessTokenPassword
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsId
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: '/lambda'
+        CreationInfo:
+          OwnerGid: "1000"
+          OwnerUid: "1000"
+          Permissions: "777"
+
+  # Create codebuild role
+  DeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub delegate-admin-deploy-${ProjectName}-role
+      MaxSessionDuration: 3600
+      Description: "Allows CodeBuild to call AWS services"
+      AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+                  - lambda.amazonaws.com
+                  - events.amazonaws.com
+              Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+          - !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-iam-access-policy
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-boundary-policy
+      Policies:
+
+        - PolicyName: AWS-ML-Deploy-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:PutLogEvents"
+                  - "logs:CreateLogStream"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:*'
+                  - 's3:*'
+                  - 'sns:*'
+                  - 'cloudformation:*'
+                  - 'ecs:*'
+                  - 'events:*'
+                  - 'elasticfilesystem:*'
+                  - 'apigateway:*'
+                  - 'ssm:*'
+                  - 'lambda:*'
+                  - 'codebuild:*'
+                  - 'ses:SendEmail'
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - "codepipeline:PutJobSuccessResult"
+                  - "codepipeline:PutJobFailureResult"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+              -
+                Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeDhcpOptions"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeVpcs"
+                  - "ec2:AssignPrivateIpAddresses"
+                  - "ec2:UnassignPrivateIpAddresses"
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                    - 'ec2:CreateNetworkInterfacePermission'
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                Condition:
+                  StringEquals: {"ec2:Subnet": [{
+                      "Fn::Join": ["", ["arn:aws:ec2:", {"Ref" : "AWS::Region" },":", {"Ref" : "AWS::AccountId"}, ":subnet/", { "Fn::Select" : [ "0", {"Ref": "Subnets"} ] }
+                        ]
+                      ]
+                    },
+                    {
+                      "Fn::Join": ["", ["arn:aws:ec2:", {"Ref" : "AWS::Region" },":", {"Ref" : "AWS::AccountId"}, ":subnet/", { "Fn::Select" : [ "1", {"Ref": "Subnets"} ] }
+                        ]
+                      ]
+                    }],
+                  "ec2:AuthorizedService": "codebuild.amazonaws.com"}
+
+  # Create codebuild to clone gitlab repo
+  CodeBuildDownloadStage:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      VpcConfig:
+        VpcId: !Ref VpcId
+        SecurityGroupIds: !Ref SecurityGroup
+        Subnets: !Ref Subnets
+      FileSystemLocations:
+        -
+          Identifier: "EFS" # access efs system through CODEBUILD_{Identifier} or CODEBUILD_EFS (cloudformation will default to uppercase)
+          Location: !Join [ '', [!Ref EfsId, '.efs.', !Ref 'AWS::Region', '.amazonaws.com:/'] ]
+          MountPoint: "/mnt/python"
+          Type: EFS
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: True
+      ServiceRole: !GetAtt "DeployServiceRole.Arn"
+      Source:
+        BuildSpec: !Sub |
+            version: 0.2
+            env:
+              exported-variables:
+                - MODEL_NAME
+                - VERSION
+                - RUN_ID
+                - MODEL_DIR
+
+              shell: bash
+            phases:
+              install:
+                  runtime-versions:
+                      python: 3.8
+              build:
+                  commands:
+                  - echo "=======================Start-Model-Copy============================="
+                  - ls
+                  - df -h
+                  - echo "******** Downloading and copying model ********"
+                  - export MODEL_NAME=`sed -n 's/^MODEL_NAME=\(.*\)/\1/p' < tmp/metadata.txt`
+                  - export SOURCE=`sed -n 's/^SOURCE=\(.*\)/\1/p' < tmp/metadata.txt`
+                  - export VERSION=`sed -n 's/^VERSION=\(.*\)/\1/p' < tmp/metadata.txt`
+                  - export RUN_ID=`sed -n 's/^RUN_ID=\(.*\)/\1/p' < tmp/metadata.txt`
+                  - export MLFLOW_DIR=`sed -n 's/^MLFLOW_DIR=\(.*\)/\1/p' < tmp/metadata.txt`
+                  - export MODEL_DIR=$CODEBUILD_EFS/lambda/$MODEL_NAME/$VERSION
+                  - echo "New model artifact detected. Model $MODEL_NAME Version $VERSION Source $SOURCE Mlflow Dir $MLFLOW_DIR"
+                  - mkdir -p $MODEL_DIR
+                  - tar -zxvf tmp/model_dir.tar.gz
+                  - cp -a tmp/model/$MLFLOW_DIR/. $MODEL_DIR
+                  - echo "******** Installing virtual environment ********"
+                  - mkdir -p $CODEBUILD_EFS/lambda/envs/$MODEL_NAME/
+                  - python3 -m venv $CODEBUILD_EFS/lambda/envs/$MODEL_NAME/$VERSION/env_stage
+                  - source $CODEBUILD_EFS/lambda/envs/$MODEL_NAME/$VERSION/env_stage/bin/activate && pip3 --default-timeout=1000 install -r tmp/model/$MLFLOW_DIR/requirements.txt
+                  - source $CODEBUILD_EFS/lambda/envs/$MODEL_NAME/$VERSION/env_stage/bin/activate && pip3 install fastapi==0.73.0 mangum==0.12.3 uvicorn[standard]==0.17.1 starlette==0.17.1
+                  - echo "============ If using MLFlow and py3.8, you will need to uninstall dataclasses since it is now built in py >= 3.8 ==============="
+                  - source $CODEBUILD_EFS/lambda/envs/$MODEL_NAME/$VERSION/env_stage/bin/activate && pip3 uninstall dataclasses -y
+                  - echo "=======================End-Model-Copy============================="
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 30
+
+  # Create codebuild to clone gitlab repo
+  CodeBuildDeployStage:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      VpcConfig:
+        VpcId: !Ref VpcId
+        SecurityGroupIds: !Ref SecurityGroup
+        Subnets: !Ref Subnets
+      FileSystemLocations:
+        -
+          Identifier: "EFS" # access efs system through CODEBUILD_{Identifier} or CODEBUILD_EFS (cloudformation will default to uppercase)
+          Location: !Join [ '', [!Ref EfsId, '.efs.', !Ref 'AWS::Region', '.amazonaws.com:/'] ]
+          MountPoint: "/mnt/python"
+          Type: EFS
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+            Type: PLAINTEXT
+          - Name: BUCKET_NAME
+            Value: !Ref S3Bucket
+            Type: PLAINTEXT
+          - Name: ACCESS_POINT_ARN
+            Value: !GetAtt AccessPoint.Arn
+            Type: PLAINTEXT
+          - Name: DEPLOY_ROLE_ARN
+            Value: !GetAtt DeployServiceRole.Arn
+            Type: PLAINTEXT
+          - Name: GIT_URL
+            Value: !Ref GitUrl
+            Type: PLAINTEXT
+          - Name: BRANCH
+            Value: !Ref Branch
+            Type: PLAINTEXT
+
+      #export STAGE="stage"
+      ServiceRole: !GetAtt "DeployServiceRole.Arn"
+      Source:
+        BuildSpec: !Sub |
+            version: 0.2
+            env:
+              parameter-store:
+                  GITLAB_USER: /$PROJECT_NAME/GitLabTokenUserName
+                  GITLAB_PASS: /$PROJECT_NAME/GitLabTokenPassword
+                  CICD_GITLAB_USER: /dev/machine-learning/CICDGitLabRepoUsername
+                  CICD_GITLAB_PASS: /dev/machine-learning/CICDGitLabRepoPassword
+                  CICD_GIT_URL: /dev/machine-learning/CICDGitLabUrl
+              shell: bash
+            phases:
+              install:
+                  runtime-versions:
+                      python: 3.8
+              build:
+                  commands:
+                  - echo "=======================Start-SAM-Deploy============================="
+                  - mkdir -p gitproject
+                  - mkdir -p samrepo
+                  - echo "=======================Clone-Repo============================="
+                  - git clone --single-branch --depth=1 --branch $BRANCH https://$GITLAB_USER:$GITLAB_PASS@$GIT_URL gitproject
+                  - echo "=======================Clone-CICD-Template-Repo============================="
+                  - git clone --single-branch --depth=1 --branch main https://$CICD_GITLAB_USER:$CICD_GITLAB_PASS@$CICD_GIT_URL samrepo
+                  - echo "=======================Copy-SAM-Deploy-Template============================="
+                  - cp -a samrepo/deploy_sam/. gitproject/$PROJECT_NAME/pipeline/inference
+                  - cd gitproject/$PROJECT_NAME/pipeline
+                  - pip --default-timeout=1000 install -r requirements.txt
+                  - echo "$MODEL_NAME, $VERSION, $RUN_ID"
+                  - export FUNC="function"
+                  - export SAM_FUNC="$MODEL_NAME$FUNC" #This is the name of the function within the SAM template
+                  - sam build function --template inference/deploy_template.yaml #Build only the called function
+                  - |
+                    sam deploy \
+                      --stack-name $PROJECT_NAME-$MODEL_NAME-$STAGE-api \
+                      --capabilities CAPABILITY_NAMED_IAM \
+                      --no-confirm-changeset \
+                      --parameter-overrides ModelName=$MODEL_NAME Version=$VERSION Stage=$STAGE EfsAccessPointArn=$ACCESS_POINT_ARN DeployRoleArn=$DEPLOY_ROLE_ARN ProjectName=$PROJECT_NAME Enabled=$ENABLED \
+                      --s3-bucket $BUCKET_NAME \
+                      --s3-prefix project/$PROJECT_NAME/sam/$MODEL_NAME \
+                      --no-fail-on-empty-changeset
+                  - echo "SAM Deploy passed"
+                  - |
+                    if [ $STAGE = "stage" ]; then
+                      echo "Invoking staged lambda for testing"
+                      python inference/test_serve.py --model_name $MODEL_NAME --run_id $RUN_ID --stage $STAGE
+                    else
+                      echo "Deploy $STAGE complete"
+                    fi
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 20
+
+  # Create codebuild step in pipeline
+  DeployPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+          Type: S3
+          Location: !Ref S3Bucket
+      Name: !Sub ods-ml-${CodePipelineName}
+      RoleArn: arn:aws:iam::080196648158:role/delegate-admin-codepipeline-ml-role #Role used for all ml codepipeline jobs
+      Stages:
+        - Name: Model-Registry-Change
+          Actions:
+            -
+              Name: ModelSource
+              ActionTypeId: 
+                Category: 'Source'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'S3'
+              OutputArtifacts: 
+                 - Name: ModelSourceOutput
+              Configuration: 
+                S3Bucket: !Ref S3Bucket
+                S3ObjectKey: !Sub 'projects/${ProjectName}/staging/${ModelArtifactKey}'
+                PollForSourceChanges: false
+              RunOrder: 1
+
+        - Name: Model-Download
+          Actions:
+
+            - Name: 'Download-to-EFS'
+              Namespace: 'BuildVars'
+              ActionTypeId:
+                Category: 'Build'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeBuild'
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              OutputArtifacts:
+                - Name: ModelDownloadOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildDownloadStage
+              RunOrder: 1
+
+        - Name: Model-Stage-SAM-deploy
+          Actions:
+
+            - Name: 'Build-SAM-Stage'
+              Namespace: 'stage'
+              ActionTypeId:
+                Category: 'Build'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeBuild'
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              OutputArtifacts:
+                - Name: ModelStageOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildDeployStage
+                EnvironmentVariables: '[{"name":"MODEL_NAME","value":"#{BuildVars.MODEL_NAME}","type":"PLAINTEXT"},
+                                        {"name":"VERSION","value":"#{BuildVars.VERSION}","type":"PLAINTEXT"},
+                                        {"name":"RUN_ID","value":"#{BuildVars.RUN_ID}","type":"PLAINTEXT"},
+                                        {"name":"MODEL_DIR","value":"#{BuildVars.MODEL_DIR}","type":"PLAINTEXT"},
+                                        {"name":"STAGE","value":"stage","type":"PLAINTEXT"},
+                                        {"name":"ENABLED","value":"false","type":"PLAINTEXT"}]'
+              RunOrder: 1
+
+            - Name: 'Endpoint-Approval'
+              Namespace: 'approval'
+              ActionTypeId:
+                Category: 'Approval'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'Manual'
+              InputArtifacts: []
+              OutputArtifacts: []
+              RunOrder: 2
+
+        - Name: Model-Dev-SAM-deploy
+          Actions:
+
+            - Name: 'Build-SAM-Prod'
+              Namespace: 'prod'
+              ActionTypeId:
+                Category: 'Build'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeBuild'
+              InputArtifacts:
+                - Name: ModelSourceOutput
+              OutputArtifacts:
+                - Name: ModelProdOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildDeployStage
+                EnvironmentVariables: '[{"name":"MODEL_NAME","value":"#{BuildVars.MODEL_NAME}","type":"PLAINTEXT"},
+                                        {"name":"VERSION","value":"#{BuildVars.VERSION}","type":"PLAINTEXT"},
+                                        {"name":"RUN_ID","value":"#{BuildVars.RUN_ID}","type":"PLAINTEXT"},
+                                        {"name":"MODEL_DIR","value":"#{BuildVars.MODEL_DIR}","type":"PLAINTEXT"},
+                                        {"name":"STAGE","value":"dev","type":"PLAINTEXT"},
+                                        {"name":"ENABLED","value":"true","type":"PLAINTEXT"}]'
+              RunOrder: 1
+
+# Create cloudwatch role
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub delegate-admin-cloudwatch-deploy-${ProjectName}-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+          - !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-iam-access-policy
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cft-developer-boundary-policy
+      Policies:
+        -
+          PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref DeployPipeline ] ]
+
+  # Create cloudwatch rule
+  AmazonCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - CopyObject
+            - PutObject
+            - CompleteMultipartUpload
+          requestParameters:
+            bucketName:
+              - !Ref S3Bucket
+            key:
+              - !Sub 'projects/${ProjectName}/staging/${ModelArtifactKey}'
+      Targets:
+        -
+          Arn:
+            !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref DeployPipeline ] ]
+          RoleArn: !GetAtt "AmazonCloudWatchEventRole.Arn"
+          Id: !Sub "Codepipeline-DeployPipeline-${ProjectName}"
+
+  
+  
